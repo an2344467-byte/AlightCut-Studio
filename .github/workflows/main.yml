@@ -1,0 +1,505 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:gal/gal.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:video_player/video_player.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const VideoEditorApp());
+}
+
+/// à´®àµ‹à´¡àµ½: à´µàµ€à´¡à´¿à´¯àµ‹à´¯à´¿àµ½ à´•à´¾à´£à´¿à´•àµà´•àµà´¨àµà´¨ à´²àµ†à´¯àµ¼ (Text à´…à´²àµà´²àµ†à´™àµà´•à´¿àµ½ Image)
+class EditorLayer {
+  final String id;
+  String type; // 'text' à´…à´²àµà´²àµ†à´™àµà´•à´¿àµ½ 'image'
+  String text;
+  String? imagePath;
+  Color textColor;
+  double fontSize;
+
+  // à´¦àµƒà´¶àµà´¯à´®à´¾à´•àµà´¨àµà´¨ à´¸à´®à´¯à´‚ (Show Time)
+  double startTime; // à´¸àµ†à´•àµà´•àµ»à´¡àµ
+  double endTime; // à´¸àµ†à´•àµà´•àµ»à´¡àµ
+
+  // à´ªàµŠà´¸à´¿à´·àµ» à´†à´¨à´¿à´®àµ‡à´·àµ» (Position Animation: Start & End)
+  Offset startPosition; // 0.0 à´®àµà´¤àµ½ 1.0 à´µà´°àµ†à´¯àµà´³àµà´³ à´±à´¿à´²àµ‡à´±àµà´±àµ€à´µàµ à´•àµ‹àµ¼à´¡à´¿à´¨àµ‡à´±àµà´±àµ
+  Offset endPosition;
+  double moveStartTime;
+  double moveEndTime;
+
+  // à´±àµŠà´Ÿàµà´Ÿàµ‡à´·àµ» à´†à´¨à´¿à´®àµ‡à´·àµ» (Rotation Animation)
+  bool enableRotation;
+  double startRotationDeg; // à´¡à´¿à´—àµà´°à´¿à´¯à´¿àµ½ (-360 to +360)
+  double endRotationDeg; // à´¡à´¿à´—àµà´°à´¿à´¯à´¿àµ½
+  double rotationStartTime; // à´¸àµ†à´•àµà´•àµ»à´¡àµ
+  double rotationEndTime; // à´¸àµ†à´•àµà´•àµ»à´¡àµ
+
+  EditorLayer({
+    required this.id,
+    this.type = 'text',
+    this.text = 'à´®à´²à´¯à´¾à´³à´‚ à´Ÿàµ†à´•àµà´¸àµà´±àµà´±àµ',
+    this.imagePath,
+    this.textColor = Colors.white,
+    this.fontSize = 28.0,
+    this.startTime = 0.0,
+    this.endTime = 5.0,
+    this.startPosition = const Offset(0.5, 0.5),
+    this.endPosition = const Offset(0.5, 0.5),
+    this.moveStartTime = 0.0,
+    this.moveEndTime = 3.0,
+    this.enableRotation = true,
+    this.startRotationDeg = 0.0,
+    this.endRotationDeg = 360.0,
+    this.rotationStartTime = 0.0,
+    this.rotationEndTime = 3.0,
+  });
+
+  /// à´¨à´¿à´²à´µà´¿à´²àµ† à´¸à´®à´¯à´¤àµà´¤àµ† à´±àµŠà´Ÿàµà´Ÿàµ‡à´·àµ» à´†à´‚à´—à´¿àµ¾ (à´±àµ‡à´¡à´¿à´¯à´¨à´¿àµ½) à´•à´£à´•àµà´•à´¾à´•àµà´•àµà´¨àµà´¨àµ
+  double getRotationAngleRad(double currentTime) {
+    if (!enableRotation) return 0.0;
+    if (currentTime <= rotationStartTime) {
+      return startRotationDeg * (math.pi / 180.0);
+    }
+    if (currentTime >= rotationEndTime) {
+      return endRotationDeg * (math.pi / 180.0);
+    }
+    final interval = rotationEndTime - rotationStartTime;
+    if (interval <= 0) return endRotationDeg * (math.pi / 180.0);
+
+    final progress = (currentTime - rotationStartTime) / interval;
+    final curDeg = startRotationDeg + (endRotationDeg - startRotationDeg) * progress;
+    return curDeg * (math.pi / 180.0);
+  }
+
+  /// à´¨à´¿à´²à´µà´¿à´²àµ† à´¸à´®à´¯à´¤àµà´¤àµ† à´ªàµŠà´¸à´¿à´·àµ» à´•à´£à´•àµà´•à´¾à´•àµà´•àµà´¨àµà´¨àµ
+  Offset getPosition(double currentTime) {
+    if (currentTime <= moveStartTime) return startPosition;
+    if (currentTime >= moveEndTime) return endPosition;
+    final interval = moveEndTime - moveStartTime;
+    if (interval <= 0) return endPosition;
+
+    final progress = (currentTime - moveStartTime) / interval;
+    return Offset(
+      startPosition.dx + (endPosition.dx - startPosition.dx) * progress,
+      startPosition.dy + (endPosition.dy - startPosition.dy) * progress,
+    );
+  }
+
+  bool isVisible(double currentTime) {
+    return currentTime >= startTime && currentTime <= endTime;
+  }
+}
+
+class VideoEditorApp extends StatelessWidget {
+  const VideoEditorApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'AlightCut Video Editor',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF0F172A),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF6366F1),
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      home: const VideoEditorScreen(),
+    );
+  }
+}
+
+class VideoEditorScreen extends StatefulWidget {
+  const VideoEditorScreen({super.key});
+
+  @override
+  State<VideoEditorScreen> createState() => _VideoEditorScreenState();
+}
+
+class _VideoEditorScreenState extends State<VideoEditorScreen>
+    with SingleTickerProviderStateMixin {
+  VideoPlayerController? _videoController;
+  final ImagePicker _picker = ImagePicker();
+
+  String? _videoPath;
+  double _videoDuration = 0.0;
+  double _currentPosition = 0.0;
+
+  // à´Ÿàµà´°à´¿à´®àµà´®à´¿à´‚à´—àµ (Trimming)
+  RangeValues _trimRange = const RangeValues(0.0, 1.0);
+
+  // à´²àµ†à´¯à´±àµà´•àµ¾ (Text / Image Layers)
+  final List<EditorLayer> _layers = [];
+  EditorLayer? _selectedLayer;
+
+  // à´²àµ†à´¯àµ¼ à´ªàµà´°à´¿à´µàµà´¯àµ‚ à´±àµ†àµ»à´¡à´±à´¿à´‚à´—àµ à´—àµà´²àµ‹à´¬àµ½ à´•àµ€
+  final Map<String, GlobalKey> _layerKeys = {};
+
+  bool _isExporting = false;
+  double _exportProgress = 0.0;
+  String _exportStatus = '';
+
+  @override
+  void initState() {
+    super.initState();
+    // à´¸à´¾à´®àµà´ªà´¿àµ¾ à´Ÿàµ†à´•àµà´¸àµà´±àµà´±àµ à´²àµ†à´¯àµ¼ (à´¤àµà´Ÿà´•àµà´•à´¤àµà´¤à´¿àµ½ à´¤à´¨àµà´¨àµ† à´±àµŠà´Ÿàµà´Ÿàµ‡à´·àµ» à´†à´¨à´¿à´®àµ‡à´·à´¨àµ‹à´Ÿàµ†)
+    final sampleLayer = EditorLayer(
+      id: 'layer_1',
+      type: 'text',
+      text: 'à´®à´²à´¯à´¾à´³à´‚ à´†à´¨à´¿à´®àµ‡à´·àµ» âœ¨',
+      startTime: 0.0,
+      endTime: 8.0,
+      startPosition: const Offset(0.5, 0.4),
+      endPosition: const Offset(0.5, 0.6),
+      moveStartTime: 0.0,
+      moveEndTime: 4.0,
+      enableRotation: true,
+      startRotationDeg: 0.0,
+      endRotationDeg: 360.0,
+      rotationStartTime: 0.0,
+      rotationEndTime: 4.0,
+    );
+    _layers.add(sampleLayer);
+    _selectedLayer = sampleLayer;
+    _layerKeys[sampleLayer.id] = GlobalKey();
+  }
+
+  @override
+  void dispose() {
+    _videoController?.dispose();
+    super.dispose();
+  }
+
+  /// à´«àµ‹à´£à´¿à´²àµ† à´—à´¾à´²à´±à´¿à´¯à´¿àµ½ à´¨à´¿à´¨àµà´¨àµ à´µàµ€à´¡à´¿à´¯àµ‹ à´‡à´‚à´ªàµ‹àµ¼à´Ÿàµà´Ÿàµ à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ
+  Future<void> _pickVideo() async {
+    final XFile? file = await _picker.pickVideo(source: ImageSource.gallery);
+    if (file == null) return;
+
+    _videoPath = file.path;
+    _videoController?.dispose();
+
+    final controller = VideoPlayerController.file(File(_videoPath!));
+    await controller.initialize();
+    controller.addListener(_onVideoTick);
+
+    setState(() {
+      _videoController = controller;
+      _videoDuration = controller.value.duration.inMilliseconds / 1000.0;
+      _trimRange = RangeValues(0.0, _videoDuration);
+    });
+    controller.play();
+  }
+
+  void _onVideoTick() {
+    if (_videoController == null || !_videoController!.value.isInitialized) return;
+    final pos = _videoController!.value.position.inMilliseconds / 1000.0;
+    setState(() {
+      _currentPosition = pos;
+    });
+
+    // à´Ÿàµà´°à´¿à´‚ à´šàµ†à´¯àµà´¤ à´…à´µà´¸à´¾à´¨à´‚ à´Žà´¤àµà´¤à´¿à´¯à´¾àµ½ à´µàµ€à´£àµà´Ÿàµà´‚ à´²àµ‚à´ªàµà´ªàµ à´šàµ†à´¯àµà´¯àµà´•
+    if (pos >= _trimRange.end) {
+      _videoController!.seekTo(Duration(milliseconds: (_trimRange.start * 1000).toInt()));
+    }
+  }
+
+  /// à´ªàµà´¤à´¿à´¯ à´Ÿàµ†à´•àµà´¸àµà´±àµà´±àµ à´²àµ†à´¯àµ¼ à´šàµ‡àµ¼à´•àµà´•àµà´•
+  void _addTextLayer() {
+    final id = 'text_${DateTime.now().millisecondsSinceEpoch}';
+    final newLayer = EditorLayer(
+      id: id,
+      type: 'text',
+      text: 'à´ªàµà´¤à´¿à´¯ à´Ÿàµ†à´•àµà´¸àµà´±àµà´±àµ',
+      startTime: _currentPosition,
+      endTime: math.min(_currentPosition + 4.0, _videoDuration > 0 ? _videoDuration : 10.0),
+      startRotationDeg: 0.0,
+      endRotationDeg: 180.0,
+      rotationStartTime: _currentPosition,
+      rotationEndTime: _currentPosition + 2.0,
+    );
+
+    setState(() {
+      _layers.add(newLayer);
+      _selectedLayer = newLayer;
+      _layerKeys[id] = GlobalKey();
+    });
+  }
+
+  /// à´«àµ‹à´£à´¿à´²àµ† à´—à´¾à´²à´±à´¿à´¯à´¿àµ½ à´¨à´¿à´¨àµà´¨àµ à´‡à´®àµ‡à´œàµ à´²àµ†à´¯àµ¼ à´šàµ‡àµ¼à´•àµà´•àµà´•
+  Future<void> _addImageLayer() async {
+    final XFile? file = await _picker.pickImage(source: ImageSource.gallery);
+    if (file == null) return;
+
+    final id = 'img_${DateTime.now().millisecondsSinceEpoch}';
+    final newLayer = EditorLayer(
+      id: id,
+      type: 'image',
+      imagePath: file.path,
+      startTime: _currentPosition,
+      endTime: math.min(_currentPosition + 4.0, _videoDuration > 0 ? _videoDuration : 10.0),
+      startRotationDeg: -45.0,
+      endRotationDeg: 45.0,
+      rotationStartTime: _currentPosition,
+      rotationEndTime: _currentPosition + 2.0,
+    );
+
+    setState(() {
+      _layers.add(newLayer);
+      _selectedLayer = newLayer;
+      _layerKeys[id] = GlobalKey();
+    });
+  }
+
+  /// à´Ÿàµ†à´•àµà´¸àµà´±àµà´±àµ à´²àµ†à´¯àµ¼ Flutter RepaintBoundary à´µà´´à´¿ PNG à´†à´¯à´¿ à´®à´¾à´±àµà´±àµà´¨àµà´¨àµ (à´®à´²à´¯à´¾à´³à´‚ à´«àµ‹à´£àµà´Ÿàµ à´¤àµ†à´±àµà´±à´¾à´¤àµ† à´µà´°à´¾àµ»)
+  Future<String?> _renderLayerToPng(EditorLayer layer) async {
+    try {
+      final boundaryKey = _layerKeys[layer.id];
+      if (boundaryKey == null || boundaryKey.currentContext == null) return null;
+
+      final boundary = boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary?;
+      if (boundary == null) return null;
+
+      final ui.Image image = await boundary.toImage(pixelRatio: 3.0);
+      final ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) return null;
+
+      final tempDir = await getTemporaryDirectory();
+      final pngFile = File('${tempDir.path}/${layer.id}.png');
+      await pngFile.writeAsBytes(byteData.buffer.asUint8List());
+      return pngFile.path;
+    } catch (e) {
+      debugPrint('Error rendering layer PNG: $e');
+      return null;
+    }
+  }
+
+  /// FFmpeg à´µà´´à´¿ à´±àµŠà´Ÿàµà´Ÿàµ‡à´·àµ» à´†à´¨à´¿à´®àµ‡à´·à´¨àµà´‚ à´²àµ†à´¯à´±àµà´•à´³àµà´‚ à´šàµ‡àµ¼à´¤àµà´¤àµ à´Žà´•àµà´¸àµà´ªàµ‹àµ¼à´Ÿàµà´Ÿàµ à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ
+  Future<void> _exportVideo() async {
+    if (_videoPath == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('à´†à´¦àµà´¯à´‚ à´’à´°àµ à´µàµ€à´¡à´¿à´¯àµ‹ à´¤à´¿à´°à´žàµà´žàµ†à´Ÿàµà´•àµà´•àµà´•')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isExporting = true;
+      _exportProgress = 0.0;
+      _exportStatus = 'à´²àµ†à´¯à´±àµà´•àµ¾ PNG à´†à´¯à´¿ à´®à´¾à´±àµà´±àµà´¨àµà´¨àµ...';
+    });
+
+    final tempDir = await getTemporaryDirectory();
+    final outputPath = '${tempDir.path}/export_${DateTime.now().millisecondsSinceEpoch}.mp4';
+
+    // 1. à´“à´°àµ‹ à´²àµ†à´¯à´±àµà´‚ PNG à´†à´¯à´¿ à´±àµ†àµ»à´¡àµ¼ à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ
+    final Map<EditorLayer, String> layerPngMap = {};
+    for (final layer in _layers) {
+      if (layer.type == 'text') {
+        final path = await _renderLayerToPng(layer);
+        if (path != null) layerPngMap[layer] = path;
+      } else if (layer.type == 'image' && layer.imagePath != null) {
+        layerPngMap[layer] = layer.imagePath!;
+      }
+    }
+
+    setState(() {
+      _exportStatus = 'FFmpeg à´±àµŠà´Ÿàµà´Ÿàµ‡à´·àµ» à´«à´¿àµ½à´Ÿàµà´Ÿàµ¼ à´ªàµà´°àµ‹à´¸à´¸àµà´¸àµ à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ...';
+    });
+
+    // 2. FFmpeg à´•à´®à´¾àµ»à´¡àµ à´¨à´¿àµ¼à´®àµà´®à´¿à´•àµà´•àµà´¨àµà´¨àµ
+    // à´¹à´¾àµ¼à´¡àµâ€Œà´µàµ†à´¯àµ¼ à´Žàµ»à´•àµ‹à´¡àµ¼: Android-àµ½ h264_mediacodec, iOS-àµ½ h264_videotoolbox
+    final isAndroid = Platform.isAndroid;
+    final encoder = isAndroid ? 'h264_mediacodec' : 'h264_videotoolbox';
+
+    final trimStart = _trimRange.start;
+    final trimDuration = _trimRange.end - _trimRange.start;
+
+    // à´‡àµ»à´ªàµà´Ÿàµà´Ÿàµà´•àµ¾ à´¤à´¯àµà´¯à´¾à´±à´¾à´•àµà´•àµ½: [0:v] à´µàµ€à´¡à´¿à´¯àµ‹, à´¤àµà´Ÿàµ¼à´¨àµà´¨àµà´³àµà´³à´µ à´²àµ†à´¯àµ¼ PNG-à´•àµ¾
+    final List<String> inputs = [
+      '-ss', trimStart.toStringAsFixed(2),
+      '-t', trimDuration.toStringAsFixed(2),
+      '-i', _videoPath!,
+    ];
+
+    int inputIndex = 1;
+    final List<String> filterChains = [];
+    String lastOutputPad = '[0:v]';
+
+    for (final entry in layerPngMap.entries) {
+      final layer = entry.key;
+      final pngPath = entry.value;
+
+      inputs.addAll(['-i', pngPath]);
+
+      // à´±àµŠà´Ÿàµà´Ÿàµ‡à´·àµ» à´†à´‚à´—à´¿à´³àµà´•àµ¾ à´±àµ‡à´¡à´¿à´¯à´¨à´¿à´²àµ‡à´•àµà´•àµ à´®à´¾à´±àµà´±àµà´¨àµà´¨àµ
+      final startRad = (layer.startRotationDeg * math.pi / 180.0).toStringAsFixed(4);
+      final endRad = (layer.endRotationDeg * math.pi / 180.0).toStringAsFixed(4);
+      final rotStart = (layer.rotationStartTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+      final rotEnd = (layer.rotationEndTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+
+      final rotPad = 'rot$inputIndex';
+      final overlayPad = 'v$inputIndex';
+
+      // à´±àµŠà´Ÿàµà´Ÿàµ‡à´·àµ» à´†à´¨à´¿à´®àµ‡à´·àµ» à´«à´¿àµ½à´Ÿàµà´Ÿàµ¼:
+      // rotate filter-àµ½ à´¸à´®à´¯à´¤àµà´¤àµ† à´†à´§à´¾à´°à´®à´¾à´•àµà´•à´¿ à´†à´‚à´—à´¿àµ¾ à´®à´¾à´±àµà´¨àµà´¨àµ:
+      // c=none@0 à´µà´´à´¿ à´±àµŠà´Ÿàµà´Ÿàµ‡à´±àµà´±àµ à´šàµ†à´¯àµà´¯àµà´®àµà´ªàµ‹àµ¾ à´ªà´¶àµà´šà´¾à´¤àµà´¤à´²à´‚ à´¸àµà´¤à´¾à´°àµà´¯à´®à´¾à´¯à´¿ (transparent) à´¨à´¿à´²à´¨à´¿àµ½à´•àµà´•àµà´‚!
+      // ow='hypot(iw,ih)':oh=ow à´µà´´à´¿ à´•àµ‹à´£àµà´•àµ¾ à´®àµà´±à´¿à´žàµà´žàµ à´ªàµ‹à´•à´¾à´¤à´¿à´°à´¿à´•àµà´•à´¾àµ» à´¬àµ‹à´•àµà´¸àµ à´µà´²àµà´¤à´¾à´•àµà´•àµà´¨àµà´¨àµ.
+      final rotExpression =
+          "angle='if(lt(t,$rotStart),$startRad,if(gt(t,$rotEnd),$endRad,$startRad+($endRad-$startRad)*(t-$rotStart)/($rotEnd-$rotStart)))':ow='hypot(iw,ih)':oh=ow:c=none@0";
+
+      filterChains.add('[$inputIndex:v]rotate=$rotExpression[$rotPad]');
+
+      // à´“à´µàµ¼à´²àµ‡ à´ªàµŠà´¸à´¿à´·àµ» à´†à´¨à´¿à´®àµ‡à´·àµ»
+      final showStart = (layer.startTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+      final showEnd = (layer.endTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+
+      // à´®àµ†à´¯à´¿àµ» à´µàµ€à´¡à´¿à´¯àµ‹à´¯à´¿à´²àµ‡à´•àµà´•àµ à´±àµŠà´Ÿàµà´Ÿàµ‡à´±àµà´±àµ à´šàµ†à´¯àµà´¤ à´²àµ†à´¯àµ¼ overlay à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ
+      filterChains.add(
+        '$lastOutputPad[$rotPad]overlay='
+        "x='main_w*0.5-overlay_w*0.5':"
+        "y='main_h*0.5-overlay_h*0.5':"
+        "enable='between(t,$showStart,$showEnd)'[$overlayPad]",
+      );
+
+      lastOutputPad = '[$overlayPad]';
+      inputIndex++;
+    }
+
+    final filterComplex = filterChains.join(';');
+
+    final List<String> commandArgs = [
+      ...inputs,
+      if (filterChains.isNotEmpty) ...[
+        '-filter_complex', filterComplex,
+        '-map', lastOutputPad,
+        '-map', '0:a?',
+      ],
+      '-c:v', encoder,
+      '-b:v', '5M',
+      '-c:a', 'aac',
+      '-y', outputPath,
+    ];
+
+    final fullCommand = commandArgs.map((arg) => arg.contains(' ') ? '"$arg"' : arg).join(' ');
+    debugPrint('FFmpeg Command: $fullCommand');
+
+    // FFmpeg à´Žà´•àµà´¸à´¿à´•àµà´¯àµ‚à´Ÿàµà´Ÿàµ à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ
+    await FFmpegKit.executeAsync(fullCommand, (session) async {
+      final returnCode = await session.getReturnCode();
+      if (ReturnCode.isSuccess(returnCode)) {
+        // Gal à´‰à´ªà´¯àµ‹à´—à´¿à´šàµà´šàµ à´«àµ‹àµº à´—à´¾à´²à´±à´¿à´¯à´¿à´²àµ‡à´•àµà´•àµ à´¸àµ‡à´µàµ à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ
+        await Gal.putVideo(outputPath);
+        setState(() {
+          _isExporting = false;
+          _exportStatus = 'à´µàµ€à´¡à´¿à´¯àµ‹ à´—à´¾à´²à´±à´¿à´¯à´¿à´²àµ‡à´•àµà´•àµ à´¸àµ‡à´µàµ à´šàµ†à´¯àµà´¤àµ! ðŸŽ‰';
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('à´µàµ€à´¡à´¿à´¯àµ‹ à´«àµ‹àµº à´—à´¾à´²à´±à´¿à´¯à´¿à´²àµ‡à´•àµà´•àµ à´¸àµ‡à´µàµ à´šàµ†à´¯àµà´¤àµ!')),
+          );
+        }
+      } else {
+        setState(() {
+          _isExporting = false;
+          _exportStatus = 'à´Žà´•àµà´¸àµà´ªàµ‹àµ¼à´Ÿàµà´Ÿàµ à´ªà´°à´¾à´œà´¯à´ªàµà´ªàµ†à´Ÿàµà´Ÿàµ';
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('AlightCut Video Editor', style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.video_library_outlined),
+            tooltip: 'à´µàµ€à´¡à´¿à´¯àµ‹ à´¤à´¿à´°à´žàµà´žàµ†à´Ÿàµà´•àµà´•àµà´•',
+            onPressed: _pickVideo,
+          ),
+          IconButton(
+            icon: const Icon(Icons.download),
+            tooltip: 'à´Žà´•àµà´¸àµà´ªàµ‹àµ¼à´Ÿàµà´Ÿàµ à´šàµ†à´¯àµà´¯àµà´•',
+            onPressed: _isExporting ? null : _exportVideo,
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // 1. à´µàµ€à´¡à´¿à´¯àµ‹ à´ªàµà´°à´¿à´µàµà´¯àµ‚ à´à´°à´¿à´¯ & à´²àµ†à´¯àµ¼ à´“à´µàµ¼à´²àµ‡
+          Expanded(
+            flex: 5,
+            child: Container(
+              color: Colors.black,
+              child: Center(
+                child: _videoController != null && _videoController!.value.isInitialized
+                    ? AspectRatio(
+                        aspectRatio: _videoController!.value.aspectRatio,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            VideoPlayer(_videoController!),
+                            // à´“à´°àµ‹ à´²àµ†à´¯à´±àµà´‚ à´²àµˆà´µà´¾à´¯à´¿ à´†à´¨à´¿à´®àµ‡à´±àµà´±àµ à´šàµ†à´¯àµà´¯àµà´¨àµà´¨àµ
+                            ..._layers.map((layer) => _buildLiveLayerWidget(layer)),
+                          ],
+                        ),
+                      )
+                    : Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(Icons.movie_creation_outlined, size: 64, color: Colors.white38),
+                          const SizedBox(height: 12),
+                          const Text('à´µàµ€à´¡à´¿à´¯àµ‹ à´¤à´¿à´°à´žàµà´žàµ†à´Ÿàµà´¤àµà´¤à´¿à´Ÿàµà´Ÿà´¿à´²àµà´²', style: TextStyle(color: Colors.white70)),
+                          const SizedBox(height: 16),
+                          ElevatedButton.icon(
+                            onPressed: _pickVideo,
+                            icon: const Icon(Icons.add),
+                            label: const Text('à´—à´¾à´²à´±à´¿à´¯à´¿àµ½ à´¨à´¿à´¨àµà´¨àµ à´µàµ€à´¡à´¿à´¯àµ‹ à´Žà´Ÿàµà´•àµà´•àµà´•'),
+                          ),
+                        ],
+                      ),
+              ),
+            ),
+          ),
+
+          // 2. à´Ÿàµà´°à´¿à´‚ & à´Ÿàµˆà´‚à´²àµˆàµ» à´¸àµà´•àµà´°à´¬àµà´¬àµ¼
+          if (_videoDuration > 0) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              color: const Color(0xFF1E293B),
+              child: Column(
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'à´¸à´®à´¯à´‚: ${_currentPosition.toStringAsFixed(1)}s / ${_videoDuration.toStringAsFixed(1)}s',
+                        style: const TextStyle(fontSize: 12, color: Colors.white70),
+                      ),
+                      Text(
+                        'à´Ÿàµà´°à´¿à´‚: ${_trimRange.start.toStringAsFixed(1)}s - ${_trimRange.end.toStringAsFixed(1)}s',
+                        style: const TextStyle(fontSize: 12, color: Colors.indigoAccent),
+                      ),
+                    ],
+                  ),
+                  RangeSlider(
+                    values: _trimRange,
+                    min: 0.0,
+                    max: _videoDuration,
+                    onChanged: (values) {
+                      setState(() {
+   
