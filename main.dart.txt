@@ -1,0 +1,786 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:gal/gal.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:video_player/video_player.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const VideoEditorApp());
+}
+
+/// മോഡൽ: വീഡിയോയിൽ കാണിക്കുന്ന ലെയർ (Text അല്ലെങ്കിൽ Image)
+class EditorLayer {
+  final String id;
+  String type; // 'text' അല്ലെങ്കിൽ 'image'
+  String text;
+  String? imagePath;
+  Color textColor;
+  double fontSize;
+
+  // ദൃശ്യമാകുന്ന സമയം (Show Time)
+  double startTime; // സെക്കൻഡ്
+  double endTime; // സെക്കൻഡ്
+
+  // പൊസിഷൻ ആനിമേഷൻ (Position Animation: Start & End)
+  Offset startPosition; // 0.0 മുതൽ 1.0 വരെയുള്ള റിലേറ്റീവ് കോർഡിനേറ്റ്
+  Offset endPosition;
+  double moveStartTime;
+  double moveEndTime;
+
+  // റൊട്ടേഷൻ ആനിമേഷൻ (Rotation Animation)
+  bool enableRotation;
+  double startRotationDeg; // ഡിഗ്രിയിൽ (-360 to +360)
+  double endRotationDeg; // ഡിഗ്രിയിൽ
+  double rotationStartTime; // സെക്കൻഡ്
+  double rotationEndTime; // സെക്കൻഡ്
+
+  EditorLayer({
+    required this.id,
+    this.type = 'text',
+    this.text = 'മലയാളം ടെക്സ്റ്റ്',
+    this.imagePath,
+    this.textColor = Colors.white,
+    this.fontSize = 28.0,
+    this.startTime = 0.0,
+    this.endTime = 5.0,
+    this.startPosition = const Offset(0.5, 0.5),
+    this.endPosition = const Offset(0.5, 0.5),
+    this.moveStartTime = 0.0,
+    this.moveEndTime = 3.0,
+    this.enableRotation = true,
+    this.startRotationDeg = 0.0,
+    this.endRotationDeg = 360.0,
+    this.rotationStartTime = 0.0,
+    this.rotationEndTime = 3.0,
+  });
+
+  /// നിലവിലെ സമയത്തെ റൊട്ടേഷൻ ആംഗിൾ (റേഡിയനിൽ) കണക്കാക്കുന്നു
+  double getRotationAngleRad(double currentTime) {
+    if (!enableRotation) return 0.0;
+    if (currentTime <= rotationStartTime) {
+      return startRotationDeg * (math.pi / 180.0);
+    }
+    if (currentTime >= rotationEndTime) {
+      return endRotationDeg * (math.pi / 180.0);
+    }
+    final interval = rotationEndTime - rotationStartTime;
+    if (interval <= 0) return endRotationDeg * (math.pi / 180.0);
+
+    final progress = (currentTime - rotationStartTime) / interval;
+    final curDeg = startRotationDeg + (endRotationDeg - startRotationDeg) * progress;
+    return curDeg * (math.pi / 180.0);
+  }
+
+  /// നിലവിലെ സമയത്തെ പൊസിഷൻ കണക്കാക്കുന്നു
+  Offset getPosition(double currentTime) {
+    if (currentTime <= moveStartTime) return startPosition;
+    if (currentTime >= moveEndTime) return endPosition;
+    final interval = moveEndTime - moveStartTime;
+    if (interval <= 0) return endPosition;
+
+    final progress = (currentTime - moveStartTime) / interval;
+    return Offset(
+      startPosition.dx + (endPosition.dx - startPosition.dx) * progress,
+      startPosition.dy + (endPosition.dy - startPosition.dy) * progress,
+    );
+  }
+
+  bool isVisible(double currentTime) {
+    return currentTime >= startTime && currentTime <= endTime;
+  }
+}
+
+class VideoEditorApp extends StatelessWidget {
+  const VideoEditorApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'AlightCut Video Editor',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF0F172A),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF6366F1),
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      home: const VideoEditorScreen(),
+    );
+  }
+}
+
+class VideoEditorScreen extends StatefulWidget {
+  const VideoEditorScreen({super.key});
+
+  @override
+  State<VideoEditorScreen> createState() => _VideoEditorScreenState();
+}
+
+class _VideoEditorScreenState extends State<VideoEditorScreen>
+    with SingleTickerProviderStateMixin {
+  VideoPlayerController? _videoController;
+  final ImagePicker _picker = ImagePicker();
+
+  String? _videoPath;
+  double _videoDuration = 0.0;
+  double _currentPosition = 0.0;
+
+  // ട്രിമ്മിംഗ് (Trimming)
+  RangeValues _trimRange = const RangeValues(0.0, 1.0);
+
+  // ലെയറുകൾ (Text / Image Layers)
+  final List<EditorLayer> _layers = [];
+  EditorLayer? _selectedLayer;
+
+  // ലെയർ പ്രിവ്യൂ റെൻഡറിംഗ് ഗ്ലോബൽ കീ
+  final Map<String, GlobalKey> _layerKeys = {};
+
+  bool _isExporting = false;
+  double _exportProgress = 0.0;
+  String _exportStatus = '';
+
+  @override
+  void initState() {
+    super.initState();
+    // സാമ്പിൾ ടെക്സ്റ്റ് ലെയർ (തുടക്കത്തിൽ തന്നെ റൊട്ടേഷൻ ആനിമേഷനോടെ)
+    final sampleLayer = EditorLayer(
+      id: 'layer_1',
+      type: 'text',
+      text: 'മലയാളം ആനിമേഷൻ ✨',
+      startTime: 0.0,
+      endTime: 8.0,
+      startPosition: const Offset(0.5, 0.4),
+      endPosition: const Offset(0.5, 0.6),
+      moveStartTime: 0.0,
+      moveEndTime: 4.0,
+      enableRotation: true,
+      startRotationDeg: 0.0,
+      endRotationDeg: 360.0,
+      rotationStartTime: 0.0,
+      rotationEndTime: 4.0,
+    );
+    _layers.add(sampleLayer);
+    _selectedLayer = sampleLayer;
+    _layerKeys[sampleLayer.id] = GlobalKey();
+  }
+
+  @override
+  void dispose() {
+    _videoController?.dispose();
+    super.dispose();
+  }
+
+  /// ഫോണിലെ ഗാലറിയിൽ നിന്ന് വീഡിയോ ഇംപോർട്ട് ചെയ്യുന്നു
+  Future<void> _pickVideo() async {
+    final XFile? file = await _picker.pickVideo(source: ImageSource.gallery);
+    if (file == null) return;
+
+    _videoPath = file.path;
+    _videoController?.dispose();
+
+    final controller = VideoPlayerController.file(File(_videoPath!));
+    await controller.initialize();
+    controller.addListener(_onVideoTick);
+
+    setState(() {
+      _videoController = controller;
+      _videoDuration = controller.value.duration.inMilliseconds / 1000.0;
+      _trimRange = RangeValues(0.0, _videoDuration);
+    });
+    controller.play();
+  }
+
+  void _onVideoTick() {
+    if (_videoController == null || !_videoController!.value.isInitialized) return;
+    final pos = _videoController!.value.position.inMilliseconds / 1000.0;
+    setState(() {
+      _currentPosition = pos;
+    });
+
+    // ട്രിം ചെയ്ത അവസാനം എത്തിയാൽ വീണ്ടും ലൂപ്പ് ചെയ്യുക
+    if (pos >= _trimRange.end) {
+      _videoController!.seekTo(Duration(milliseconds: (_trimRange.start * 1000).toInt()));
+    }
+  }
+
+  /// പുതിയ ടെക്സ്റ്റ് ലെയർ ചേർക്കുക
+  void _addTextLayer() {
+    final id = 'text_${DateTime.now().millisecondsSinceEpoch}';
+    final newLayer = EditorLayer(
+      id: id,
+      type: 'text',
+      text: 'പുതിയ ടെക്സ്റ്റ്',
+      startTime: _currentPosition,
+      endTime: math.min(_currentPosition + 4.0, _videoDuration > 0 ? _videoDuration : 10.0),
+      startRotationDeg: 0.0,
+      endRotationDeg: 180.0,
+      rotationStartTime: _currentPosition,
+      rotationEndTime: _currentPosition + 2.0,
+    );
+
+    setState(() {
+      _layers.add(newLayer);
+      _selectedLayer = newLayer;
+      _layerKeys[id] = GlobalKey();
+    });
+  }
+
+  /// ഫോണിലെ ഗാലറിയിൽ നിന്ന് ഇമേജ് ലെയർ ചേർക്കുക
+  Future<void> _addImageLayer() async {
+    final XFile? file = await _picker.pickImage(source: ImageSource.gallery);
+    if (file == null) return;
+
+    final id = 'img_${DateTime.now().millisecondsSinceEpoch}';
+    final newLayer = EditorLayer(
+      id: id,
+      type: 'image',
+      imagePath: file.path,
+      startTime: _currentPosition,
+      endTime: math.min(_currentPosition + 4.0, _videoDuration > 0 ? _videoDuration : 10.0),
+      startRotationDeg: -45.0,
+      endRotationDeg: 45.0,
+      rotationStartTime: _currentPosition,
+      rotationEndTime: _currentPosition + 2.0,
+    );
+
+    setState(() {
+      _layers.add(newLayer);
+      _selectedLayer = newLayer;
+      _layerKeys[id] = GlobalKey();
+    });
+  }
+
+  /// ടെക്സ്റ്റ് ലെയർ Flutter RepaintBoundary വഴി PNG ആയി മാറ്റുന്നു (മലയാളം ഫോണ്ട് തെറ്റാതെ വരാൻ)
+  Future<String?> _renderLayerToPng(EditorLayer layer) async {
+    try {
+      final boundaryKey = _layerKeys[layer.id];
+      if (boundaryKey == null || boundaryKey.currentContext == null) return null;
+
+      final boundary = boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary?;
+      if (boundary == null) return null;
+
+      final ui.Image image = await boundary.toImage(pixelRatio: 3.0);
+      final ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) return null;
+
+      final tempDir = await getTemporaryDirectory();
+      final pngFile = File('${tempDir.path}/${layer.id}.png');
+      await pngFile.writeAsBytes(byteData.buffer.asUint8List());
+      return pngFile.path;
+    } catch (e) {
+      debugPrint('Error rendering layer PNG: $e');
+      return null;
+    }
+  }
+
+  /// FFmpeg വഴി റൊട്ടേഷൻ ആനിമേഷനും ലെയറുകളും ചേർത്ത് എക്സ്പോർട്ട് ചെയ്യുന്നു
+  Future<void> _exportVideo() async {
+    if (_videoPath == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ആദ്യം ഒരു വീഡിയോ തിരഞ്ഞെടുക്കുക')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isExporting = true;
+      _exportProgress = 0.0;
+      _exportStatus = 'ലെയറുകൾ PNG ആയി മാറ്റുന്നു...';
+    });
+
+    final tempDir = await getTemporaryDirectory();
+    final outputPath = '${tempDir.path}/export_${DateTime.now().millisecondsSinceEpoch}.mp4';
+
+    // 1. ഓരോ ലെയറും PNG ആയി റെൻഡർ ചെയ്യുന്നു
+    final Map<EditorLayer, String> layerPngMap = {};
+    for (final layer in _layers) {
+      if (layer.type == 'text') {
+        final path = await _renderLayerToPng(layer);
+        if (path != null) layerPngMap[layer] = path;
+      } else if (layer.type == 'image' && layer.imagePath != null) {
+        layerPngMap[layer] = layer.imagePath!;
+      }
+    }
+
+    setState(() {
+      _exportStatus = 'FFmpeg റൊട്ടേഷൻ ഫിൽട്ടർ പ്രോസസ്സ് ചെയ്യുന്നു...';
+    });
+
+    // 2. FFmpeg കമാൻഡ് നിർമ്മിക്കുന്നു
+    // ഹാർഡ്‌വെയർ എൻകോഡർ: Android-ൽ h264_mediacodec, iOS-ൽ h264_videotoolbox
+    final isAndroid = Platform.isAndroid;
+    final encoder = isAndroid ? 'h264_mediacodec' : 'h264_videotoolbox';
+
+    final trimStart = _trimRange.start;
+    final trimDuration = _trimRange.end - _trimRange.start;
+
+    // ഇൻപുട്ടുകൾ തയ്യാറാക്കൽ: [0:v] വീഡിയോ, തുടർന്നുള്ളവ ലെയർ PNG-കൾ
+    final List<String> inputs = [
+      '-ss', trimStart.toStringAsFixed(2),
+      '-t', trimDuration.toStringAsFixed(2),
+      '-i', _videoPath!,
+    ];
+
+    int inputIndex = 1;
+    final List<String> filterChains = [];
+    String lastOutputPad = '[0:v]';
+
+    for (final entry in layerPngMap.entries) {
+      final layer = entry.key;
+      final pngPath = entry.value;
+
+      inputs.addAll(['-i', pngPath]);
+
+      // റൊട്ടേഷൻ ആംഗിളുകൾ റേഡിയനിലേക്ക് മാറ്റുന്നു
+      final startRad = (layer.startRotationDeg * math.pi / 180.0).toStringAsFixed(4);
+      final endRad = (layer.endRotationDeg * math.pi / 180.0).toStringAsFixed(4);
+      final rotStart = (layer.rotationStartTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+      final rotEnd = (layer.rotationEndTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+
+      final rotPad = 'rot$inputIndex';
+      final overlayPad = 'v$inputIndex';
+
+      // റൊട്ടേഷൻ ആനിമേഷൻ ഫിൽട്ടർ:
+      // rotate filter-ൽ സമയത്തെ ആധാരമാക്കി ആംഗിൾ മാറുന്നു:
+      // c=none@0 വഴി റൊട്ടേറ്റ് ചെയ്യുമ്പോൾ പശ്ചാത്തലം സുതാര്യമായി (transparent) നിലനിൽക്കും!
+      // ow='hypot(iw,ih)':oh=ow വഴി കോണുകൾ മുറിഞ്ഞു പോകാതിരിക്കാൻ ബോക്സ് വലുതാക്കുന്നു.
+      final rotExpression =
+          "angle='if(lt(t,$rotStart),$startRad,if(gt(t,$rotEnd),$endRad,$startRad+($endRad-$startRad)*(t-$rotStart)/($rotEnd-$rotStart)))':ow='hypot(iw,ih)':oh=ow:c=none@0";
+
+      filterChains.add('[$inputIndex:v]rotate=$rotExpression[$rotPad]');
+
+      // ഓവർലേ പൊസിഷൻ ആനിമേഷൻ
+      final showStart = (layer.startTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+      final showEnd = (layer.endTime - trimStart).clamp(0.0, 999.0).toStringAsFixed(2);
+
+      // മെയിൻ വീഡിയോയിലേക്ക് റൊട്ടേറ്റ് ചെയ്ത ലെയർ overlay ചെയ്യുന്നു
+      filterChains.add(
+        '$lastOutputPad[$rotPad]overlay='
+        "x='main_w*0.5-overlay_w*0.5':"
+        "y='main_h*0.5-overlay_h*0.5':"
+        "enable='between(t,$showStart,$showEnd)'[$overlayPad]",
+      );
+
+      lastOutputPad = '[$overlayPad]';
+      inputIndex++;
+    }
+
+    final filterComplex = filterChains.join(';');
+
+    final List<String> commandArgs = [
+      ...inputs,
+      if (filterChains.isNotEmpty) ...[
+        '-filter_complex', filterComplex,
+        '-map', lastOutputPad,
+        '-map', '0:a?',
+      ],
+      '-c:v', encoder,
+      '-b:v', '5M',
+      '-c:a', 'aac',
+      '-y', outputPath,
+    ];
+
+    final fullCommand = commandArgs.map((arg) => arg.contains(' ') ? '"$arg"' : arg).join(' ');
+    debugPrint('FFmpeg Command: $fullCommand');
+
+    // FFmpeg എക്സിക്യൂട്ട് ചെയ്യുന്നു
+    await FFmpegKit.executeAsync(fullCommand, (session) async {
+      final returnCode = await session.getReturnCode();
+      if (ReturnCode.isSuccess(returnCode)) {
+        // Gal ഉപയോഗിച്ച് ഫോൺ ഗാലറിയിലേക്ക് സേവ് ചെയ്യുന്നു
+        await Gal.putVideo(outputPath);
+        setState(() {
+          _isExporting = false;
+          _exportStatus = 'വീഡിയോ ഗാലറിയിലേക്ക് സേവ് ചെയ്തു! 🎉';
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('വീഡിയോ ഫോൺ ഗാലറിയിലേക്ക് സേവ് ചെയ്തു!')),
+          );
+        }
+      } else {
+        setState(() {
+          _isExporting = false;
+          _exportStatus = 'എക്സ്പോർട്ട് പരാജയപ്പെട്ടു';
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('AlightCut Video Editor', style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.video_library_outlined),
+            tooltip: 'വീഡിയോ തിരഞ്ഞെടുക്കുക',
+            onPressed: _pickVideo,
+          ),
+          IconButton(
+            icon: const Icon(Icons.download),
+            tooltip: 'എക്സ്പോർട്ട് ചെയ്യുക',
+            onPressed: _isExporting ? null : _exportVideo,
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // 1. വീഡിയോ പ്രിവ്യൂ ഏരിയ & ലെയർ ഓവർലേ
+          Expanded(
+            flex: 5,
+            child: Container(
+              color: Colors.black,
+              child: Center(
+                child: _videoController != null && _videoController!.value.isInitialized
+                    ? AspectRatio(
+                        aspectRatio: _videoController!.value.aspectRatio,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            VideoPlayer(_videoController!),
+                            // ഓരോ ലെയറും ലൈവായി ആനിമേറ്റ് ചെയ്യുന്നു
+                            ..._layers.map((layer) => _buildLiveLayerWidget(layer)),
+                          ],
+                        ),
+                      )
+                    : Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(Icons.movie_creation_outlined, size: 64, color: Colors.white38),
+                          const SizedBox(height: 12),
+                          const Text('വീഡിയോ തിരഞ്ഞെടുത്തിട്ടില്ല', style: TextStyle(color: Colors.white70)),
+                          const SizedBox(height: 16),
+                          ElevatedButton.icon(
+                            onPressed: _pickVideo,
+                            icon: const Icon(Icons.add),
+                            label: const Text('ഗാലറിയിൽ നിന്ന് വീഡിയോ എടുക്കുക'),
+                          ),
+                        ],
+                      ),
+              ),
+            ),
+          ),
+
+          // 2. ട്രിം & ടൈംലൈൻ സ്ക്രബ്ബർ
+          if (_videoDuration > 0) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              color: const Color(0xFF1E293B),
+              child: Column(
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'സമയം: ${_currentPosition.toStringAsFixed(1)}s / ${_videoDuration.toStringAsFixed(1)}s',
+                        style: const TextStyle(fontSize: 12, color: Colors.white70),
+                      ),
+                      Text(
+                        'ട്രിം: ${_trimRange.start.toStringAsFixed(1)}s - ${_trimRange.end.toStringAsFixed(1)}s',
+                        style: const TextStyle(fontSize: 12, color: Colors.indigoAccent),
+                      ),
+                    ],
+                  ),
+                  RangeSlider(
+                    values: _trimRange,
+                    min: 0.0,
+                    max: _videoDuration,
+                    onChanged: (values) {
+                      setState(() {
+                        _trimRange = values;
+                        if (_currentPosition < values.start || _currentPosition > values.end) {
+                          _videoController?.seekTo(Duration(milliseconds: (values.start * 1000).toInt()));
+                        }
+                      });
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ],
+
+          // 3. ലെയറുകൾ ചേർക്കാനുള്ള ബട്ടണുകൾ
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: const Color(0xFF1E293B),
+            child: Row(
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _addTextLayer,
+                  icon: const Icon(Icons.title, size: 18),
+                  label: const Text('ടെക്സ്റ്റ് ലെയർ'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _addImageLayer,
+                  icon: const Icon(Icons.image, size: 18),
+                  label: const Text('ഇമേജ് ലെയർ'),
+                ),
+                const Spacer(),
+                if (_videoController != null)
+                  IconButton(
+                    icon: Icon(_videoController!.value.isPlaying ? Icons.pause : Icons.play_arrow),
+                    onPressed: () {
+                      setState(() {
+                        if (_videoController!.value.isPlaying) {
+                          _videoController!.pause();
+                        } else {
+                          _videoController!.play();
+                        }
+                      });
+                    },
+                  ),
+              ],
+            ),
+          ),
+
+          // 4. തിരഞ്ഞെടുത്ത ലെയറിൻ്റെ റൊട്ടേഷൻ & പ്രോപ്പർട്ടി എഡിറ്റർ
+          Expanded(
+            flex: 4,
+            child: _selectedLayer != null
+                ? _buildRotationControlPanel(_selectedLayer!)
+                : const Center(
+                    child: Text('ഒരു ലെയർ തിരഞ്ഞെടുക്കുക', style: TextStyle(color: Colors.white54)),
+                  ),
+          ),
+
+          // എക്സ്പോർട്ട് പ്രോഗ്രസ് ബാർ
+          if (_isExporting)
+            Container(
+              padding: const EdgeInsets.all(12),
+              color: Colors.indigo,
+              child: Row(
+                children: [
+                  const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(_exportStatus, style: const TextStyle(fontSize: 13, color: Colors.white)),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// പ്രിവ്യൂവിൽ ലെയർ തത്സമയം റൊട്ടേഷൻ ചെയ്ത് റെൻഡർ ചെയ്യുന്നു
+  Widget _buildLiveLayerWidget(EditorLayer layer) {
+    if (!layer.isVisible(_currentPosition)) return const SizedBox.shrink();
+
+    final rotAngleRad = layer.getRotationAngleRad(_currentPosition);
+    final pos = layer.getPosition(_currentPosition);
+    final isSelected = _selectedLayer?.id == layer.id;
+
+    Widget content;
+    if (layer.type == 'text') {
+      content = RepaintBoundary(
+        key: _layerKeys[layer.id],
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.black45,
+            borderRadius: BorderRadius.circular(8),
+            border: isSelected ? Border.all(color: Colors.indigoAccent, width: 2) : null,
+          ),
+          child: Text(
+            layer.text,
+            style: TextStyle(
+              color: layer.textColor,
+              fontSize: layer.fontSize,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      );
+    } else {
+      content = Container(
+        decoration: BoxDecoration(
+          border: isSelected ? Border.all(color: Colors.indigoAccent, width: 2) : null,
+        ),
+        child: layer.imagePath != null
+            ? Image.file(File(layer.imagePath!), width: 120, height: 120, fit: BoxFit.contain)
+            : const Icon(Icons.image, size: 80),
+      );
+    }
+
+    return Positioned(
+      left: MediaQuery.of(context).size.width * pos.dx - 60,
+      top: 180 * pos.dy,
+      child: GestureDetector(
+        onTap: () => setState(() => _selectedLayer = layer),
+        onPanUpdate: (details) {
+          setState(() {
+            layer.startPosition = Offset(
+              (layer.startPosition.dx + details.delta.dx / 300).clamp(0.0, 1.0),
+              (layer.startPosition.dy + details.delta.dy / 300).clamp(0.0, 1.0),
+            );
+          });
+        },
+        child: Transform.rotate(
+          angle: rotAngleRad,
+          alignment: Alignment.center,
+          child: content,
+        ),
+      ),
+    );
+  }
+
+  /// റൊട്ടേഷൻ ആനിമേഷൻ കൺട്രോൾ പാനൽ (Start Angle, End Angle, Time Interval)
+  Widget _buildRotationControlPanel(EditorLayer layer) {
+    return Container(
+      color: const Color(0xFF0B1120),
+      padding: const EdgeInsets.all(12),
+      child: ListView(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'റൊട്ടേഷൻ ആനിമേഷൻ (${layer.type == "text" ? "Text" : "Image"})',
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+              ),
+              Switch(
+                value: layer.enableRotation,
+                onChanged: (val) => setState(() => layer.enableRotation = val),
+              ),
+            ],
+          ),
+          const Divider(height: 12),
+
+          if (layer.type == 'text') ...[
+            TextField(
+              decoration: const InputDecoration(
+                labelText: 'ടെക്സ്റ്റ് മാറ്റുക (മലയാളം സപ്പോർട്ട്)',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              controller: TextEditingController(text: layer.text),
+              onChanged: (val) => setState(() => layer.text = val),
+            ),
+            const SizedBox(height: 12),
+          ],
+
+          // Start Rotation Angle Slider
+          Row(
+            children: [
+              Expanded(
+                child: Text('തുടക്ക ആംഗിൾ (Start): ${layer.startRotationDeg.toInt()}°'),
+              ),
+              Text('${layer.startRotationDeg.toStringAsFixed(0)}°'),
+            ],
+          ),
+          Slider(
+            value: layer.startRotationDeg,
+            min: -360.0,
+            max: 360.0,
+            divisions: 72,
+            label: '${layer.startRotationDeg.toInt()}°',
+            onChanged: (val) => setState(() => layer.startRotationDeg = val),
+          ),
+
+          // End Rotation Angle Slider
+          Row(
+            children: [
+              Expanded(
+                child: Text('അവസാന ആംഗിൾ (End): ${layer.endRotationDeg.toInt()}°'),
+              ),
+              Text('${layer.endRotationDeg.toStringAsFixed(0)}°'),
+            ],
+          ),
+          Slider(
+            value: layer.endRotationDeg,
+            min: -360.0,
+            max: 360.0,
+            divisions: 72,
+            label: '${layer.endRotationDeg.toInt()}°',
+            onChanged: (val) => setState(() => layer.endRotationDeg = val),
+          ),
+
+          // ആനിമേഷൻ സമയം (Rotation Time Interval)
+          const SizedBox(height: 4),
+          Text(
+            'റൊട്ടേഷൻ സമയം: ${layer.rotationStartTime.toStringAsFixed(1)}s മുതൽ ${layer.rotationEndTime.toStringAsFixed(1)}s വരെ',
+            style: const TextStyle(fontSize: 12, color: Colors.indigoAccent, fontWeight: FontWeight.bold),
+          ),
+          RangeSlider(
+            values: RangeValues(
+              layer.rotationStartTime.clamp(0.0, _videoDuration > 0 ? _videoDuration : 10.0),
+              layer.rotationEndTime.clamp(0.0, _videoDuration > 0 ? _videoDuration : 10.0),
+            ),
+            min: 0.0,
+            max: _videoDuration > 0 ? _videoDuration : 10.0,
+            onChanged: (range) {
+              setState(() {
+                layer.rotationStartTime = range.start;
+                layer.rotationEndTime = range.end;
+              });
+            },
+          ),
+
+          // ദ്രുത റൊട്ടേഷൻ പ്രീസെറ്റുകൾ (Quick Presets)
+          Wrap(
+            spacing: 8,
+            children: [
+              ActionChip(
+                label: const Text('360° Spin (പൂർണ്ണ കറക്കം)'),
+                onPressed: () {
+                  setState(() {
+                    layer.startRotationDeg = 0.0;
+                    layer.endRotationDeg = 360.0;
+                  });
+                },
+              ),
+              ActionChip(
+                label: const Text('-45° to +45° Sway'),
+                onPressed: () {
+                  setState(() {
+                    layer.startRotationDeg = -45.0;
+                    layer.endRotationDeg = 45.0;
+                  });
+                },
+              ),
+              ActionChip(
+                label: const Text('180° Flip'),
+                onPressed: () {
+                  setState(() {
+                    layer.startRotationDeg = 0.0;
+                    layer.endRotationDeg = 180.0;
+                  });
+                },
+              ),
+              ActionChip(
+                label: const Text('Reset (0°)'),
+                onPressed: () {
+                  setState(() {
+                    layer.startRotationDeg = 0.0;
+                    layer.endRotationDeg = 0.0;
+                  });
+                },
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
